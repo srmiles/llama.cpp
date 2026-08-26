@@ -6142,6 +6142,12 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 ggml_type src0_type = op->src[0]->type;
 
+                // TQ1_0/TQ2_0 have no MMVQ kernel and no dequantize path here, so both
+                // dispatch routes abort. Say no, and let ggml use the CPU.
+                if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) {
+                    return false;
+                }
+
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
