@@ -4784,6 +4784,55 @@ static bool reorder_qw_q4_k_moe(uint8_t * data_device, size_t expert_bytes, int6
     return true;
 }
 
+// Reorder each Q4_0 expert slice into [qs][d], a few experts at a time (see Q4_K above).
+static bool reorder_qw_q4_0_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
+    GGML_ASSERT(expert_bytes % sizeof(block_q4_0) == 0);
+    const int     blocks_per_expert = (int) (expert_bytes / sizeof(block_q4_0));
+    const size_t  max_chunk_bytes   = 32u << 20;
+    const int64_t chunk_experts     = std::max<int64_t>(1, std::min<int64_t>(n_expert, (int64_t) (max_chunk_bytes / expert_bytes)));
+
+    sycl_reorder_temp_buffer tmp(stream, (size_t) chunk_experts * expert_bytes);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__,
+                      (size_t) chunk_experts * expert_bytes);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    // the queue is in-order: each chunk's copy into tmp_buf waits for the previous chunk's kernel
+    for (int64_t e0 = 0; e0 < n_expert; e0 += chunk_experts) {
+        const int64_t n_chunk = std::min(chunk_experts, n_expert - e0);
+        uint8_t *     chunk   = data_device + (size_t) e0 * expert_bytes;
+
+        sycl::event copy_event;
+        SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, chunk, (size_t) n_chunk * expert_bytes)));
+        if (!g_ggml_sycl_use_async_mem_op) {
+            copy_event.wait();
+        }
+
+        const int total_blocks = blocks_per_expert * (int) n_chunk;
+        auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
+            const int          gb   = gb_;
+            const int          e    = gb / blocks_per_expert;
+            const int          ib   = gb % blocks_per_expert;
+            const block_q4_0 * x    = (const block_q4_0 *) (tmp_buf + (size_t) e * expert_bytes);
+            uint8_t *          base = chunk + (size_t) e * expert_bytes;
+
+            auto * qs_ptr = base;
+            auto * d_ptr  = (sycl::half *) (qs_ptr + (size_t) (QK4_0 / 2) * blocks_per_expert);
+
+            for (int j = 0; j < QK4_0 / 2; ++j) {
+                qs_ptr[ib * (QK4_0 / 2) + j] = x[ib].qs[j];
+            }
+            d_ptr[ib] = x[ib].d;
+        });
+        if (!g_ggml_sycl_use_async_mem_op) {
+            reorder_event.wait_and_throw();
+        }
+    }
+    return true;
+}
+
 // Reorder each Q5_K expert slice into [qs][qh][scales][dm], a few experts at a time (see Q4_K above).
 static bool reorder_qw_q5_k_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
     GGML_ASSERT(expert_bytes % sizeof(block_q5_K) == 0);
@@ -5045,6 +5094,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     if (src0->ne[2] > 1) {
         GGML_ASSERT((size_t) size == (size_t) src0->ne[2] * src0->nb[2]);
         switch (src0->type) {
+            case GGML_TYPE_Q4_0:
+                return reorder_qw_q4_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q8_0:
                 return reorder_qw_q8_0_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q4_K:
@@ -5132,7 +5183,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K &&
+    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K &&
         src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_MXFP4) {
         return;
     }
