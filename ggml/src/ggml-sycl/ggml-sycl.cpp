@@ -4619,9 +4619,18 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
            src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
 }
 
+// Max activation columns routed through MMVQ. Above this, dequantize + GEMM wins.
+static int64_t mmvq_max_cols() {
+    static int64_t v = [] {
+        const char * s = std::getenv("GGML_SYCL_MMVQ_MAX_COLS");
+        return s ? std::max<int64_t>(1, std::atoll(s)) : (int64_t) MMVQ_MAX_BATCH_SIZE;
+    }();
+    return v;
+}
+
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+           src1->ne[1] <= mmvq_max_cols();
 }
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

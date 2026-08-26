@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "mmvq.hpp"
 
 #include "ggml.h"
@@ -2150,7 +2151,7 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl_switch_ncols(
     }
 }
 
-void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+static void ggml_sycl_op_mul_mat_vec_q_impl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
                                 const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
                                 const int64_t row_high, const int64_t src1_ncols, const int64_t src1_padded_col_size,
@@ -2851,5 +2852,23 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             return true;
         default:
             return false;
+    }
+}
+
+// The per-type kernels take at most MMVQ_MAX_BATCH_SIZE columns. Split bigger
+// requests into chunks of that size, so each chunk keeps a shape they handle.
+void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+                                const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low,
+                                const int64_t row_high, const int64_t src1_ncols, const int64_t src1_padded_col_size,
+                                const dpct::queue_ptr & stream) {
+    const size_t q8_1_ts = sizeof(block_q8_1);
+    const size_t q8_1_bs = QK8_1;
+    for (int64_t col0 = 0; col0 < src1_ncols; col0 += MMVQ_MAX_BATCH_SIZE) {
+        const int64_t ncols = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, src1_ncols - col0);
+        const char *  src1_chunk = src1_ddq_i + col0 * src1_padded_col_size * q8_1_ts / q8_1_bs;
+        float *       dst_chunk  = dst_dd_i + col0 * dst->ne[0];
+        ggml_sycl_op_mul_mat_vec_q_impl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_chunk,
+                                        dst_chunk, row_low, row_high, ncols, src1_padded_col_size, stream);
     }
 }
