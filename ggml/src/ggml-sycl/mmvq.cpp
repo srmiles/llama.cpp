@@ -2883,19 +2883,27 @@ static void launch_mul_mat_vec_q_reorder_glu(const void * vx, const void * vgate
     });
 }
 
-bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
-                                         const void * vgate, const void * vy, float * dst, int ncols, int nrows,
-                                         int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
-                                         dpct::queue_ptr stream) {
-    if (src0_type != GGML_TYPE_Q4_K) {
-        return false;
+// Kept in step with the type switch below. A disagreement costs a wasted reorder and
+// falls back to the unfused path, so it degrades speed rather than correctness.
+bool ggml_sycl_supports_mmvq_glu_reorder(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
     }
-    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
-        return false;
-    }
+}
 
-    using vec_dot = reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>;
-
+template <typename vec_dot>
+static bool launch_glu_reorder_by_ncols(const void * vx, const void * vgate, const void * vy, float * dst, int ncols,
+                                        int nrows, int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+                                        enum ggml_glu_op glu_op, dpct::queue_ptr stream) {
     switch (ncols_dst) {
         case 1:
             launch_mul_mat_vec_q_reorder_glu<vec_dot, 1>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes,
@@ -2932,6 +2940,34 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
         default:
             return false;
     }
+}
+
+bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
+                                         const void * vgate, const void * vy, float * dst, int ncols, int nrows,
+                                         int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+                                         dpct::queue_ptr stream) {
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+
+#define GLU_REORDER_CASE(t)                                                                            \
+    case t:                                                                                            \
+        return launch_glu_reorder_by_ncols<reorder_vec_dot_q_sycl<t>>(                                  \
+            vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, glu_op,    \
+            stream)
+
+    switch (src0_type) {
+        GLU_REORDER_CASE(GGML_TYPE_Q4_0);
+        GLU_REORDER_CASE(GGML_TYPE_Q8_0);
+        GLU_REORDER_CASE(GGML_TYPE_Q2_K);
+        GLU_REORDER_CASE(GGML_TYPE_Q3_K);
+        GLU_REORDER_CASE(GGML_TYPE_Q4_K);
+        GLU_REORDER_CASE(GGML_TYPE_Q5_K);
+        GLU_REORDER_CASE(GGML_TYPE_Q6_K);
+        default:
+            return false;
+    }
+#undef GLU_REORDER_CASE
 }
 
 // The per-type kernels take at most MMVQ_MAX_BATCH_SIZE columns. Split bigger

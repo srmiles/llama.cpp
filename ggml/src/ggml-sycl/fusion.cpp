@@ -1,4 +1,5 @@
 #include "fusion.hpp"
+#include "mmvq.hpp"
 
 #include <algorithm>
 
@@ -29,8 +30,8 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // only q4_K has a fused reorder GEMV so far, and it walks whole super-blocks
-    if (wu->type != GGML_TYPE_Q4_K || wu->ne[0] % QK_K != 0) {
+    // the fused GEMV walks whole blocks, so the row must divide by this type's block size
+    if (!ggml_sycl_supports_mmvq_glu_reorder(wu->type) || wu->ne[0] % ggml_blck_size(wu->type) != 0) {
         return false;
     }
 
