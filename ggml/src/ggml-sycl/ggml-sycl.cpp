@@ -2650,6 +2650,161 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+
+#if GGML_SYCL_DNNL
+// PROTOTYPE (throwaway, env-gated): feed Q4_0 weights straight to oneDNN via its
+// weight-decompression path instead of materializing fp16 every call.
+// Keeps a SECOND, transposed copy of the weights - so it costs +100% weight VRAM
+// and is only for measuring the end-to-end delta on a small model.
+struct dnnl_decomp_entry { void * w = nullptr; void * s = nullptr; int64_t k = 0, m = 0; };
+static std::unordered_map<const void *, dnnl_decomp_entry> g_decomp_cache;
+static std::mutex g_decomp_mutex;
+
+static bool ggml_sycl_dnnl_decomp_enabled() {
+    static const int v = ggml_sycl_get_env("GGML_SYCL_DNNL_DECOMP", 0);
+    return v != 0;
+}
+
+// Repack Q4_0 -> s4 weights (K x M, row-major) + f16 scales (K/32 x M, row-major).
+// s4 stores q-8 because oneDNN rejects a weights zero-point on this device.
+static dnnl_decomp_entry dnnl_decomp_repack(const ggml_tensor * src0, const char * src0_dd_i,
+                                            int64_t K, int64_t M, bool reordered, dpct::queue_ptr stream) {
+    dnnl_decomp_entry e;
+    e.k = K; e.m = M;
+    const int64_t nblk = K / QK4_0;
+    e.w = (void *) sycl::malloc_device<uint8_t>((size_t) (K * M / 2), *stream);
+    e.s = (void *) sycl::malloc_device<sycl::half>((size_t) (nblk * M), *stream);
+    if (!e.w || !e.s) { e.w = e.s = nullptr; return e; }
+
+    const uint8_t * base = (const uint8_t *) src0_dd_i;
+    uint8_t *     wdst = (uint8_t *) e.w;
+    sycl::half *  sdst = (sycl::half *) e.s;
+
+    // one work-item per output BYTE: packs rows r and r+1 for a given k
+    stream->parallel_for((size_t) (K * M / 2), [=](sycl::id<1> idx) {
+        const int64_t di = (int64_t) idx[0];         // byte index into (K x M) s4
+        const int64_t k  = (di * 2) / M;
+        const int64_t r0 = (di * 2) % M;
+        uint8_t out = 0;
+        for (int half_i = 0; half_i < 2; ++half_i) {
+            const int64_t r = r0 + half_i;
+            const int64_t kb = k / QK4_0;            // block along K
+            const int64_t j  = k % QK4_0;            // element within block
+            const int64_t gb = r * nblk + kb;        // global block index (row-major)
+            uint8_t qbyte;
+            if (reordered) {
+                qbyte = base[gb * (QK4_0 / 2) + (j % (QK4_0 / 2))];
+            } else {
+                const uint8_t * blk = base + gb * (sizeof(sycl::half) + QK4_0 / 2);
+                qbyte = blk[sizeof(sycl::half) + (j % (QK4_0 / 2))];
+            }
+            const int nib = (j < QK4_0 / 2) ? (qbyte & 0x0F) : (qbyte >> 4);
+            const uint8_t v = (uint8_t) ((nib - 8) & 0x0F);
+            out |= (half_i == 0) ? v : (uint8_t) (v << 4);
+        }
+        wdst[di] = out;
+    });
+    stream->parallel_for((size_t) (nblk * M), [=](sycl::id<1> idx) {
+        const int64_t i  = (int64_t) idx[0];
+        const int64_t kb = i / M, r = i % M;
+        const int64_t gb = r * nblk + kb;
+        sycl::half d;
+        if (reordered) {
+            d = ((const sycl::half *) (base + (size_t) K * M / 2))[gb];
+        } else {
+            d = *(const sycl::half *) (base + gb * (sizeof(sycl::half) + QK4_0 / 2));
+        }
+        sdst[i] = d;
+    });
+    stream->wait();
+    return e;
+}
+
+static bool ggml_sycl_dnnl_decomp_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                          const ggml_tensor * src1,
+                                          const char * src0_dd_i, const sycl::half * src1_f16,
+                                          float * dst_dd_i, int64_t row_diff, int64_t src1_ncols,
+                                          int64_t ne10, const dpct::queue_ptr & stream) {
+    if (!ggml_sycl_dnnl_decomp_enabled()) return false;
+    if (src0->type != GGML_TYPE_Q4_0) {
+        static std::atomic<int> skips{0};
+        if (++skips == 1) GGML_LOG_INFO("dnnl-decomp: skipping, src0 type is %s\n", ggml_type_name(src0->type));
+        return false;
+    }
+    if (ne10 % QK4_0 != 0) return false;
+    // prototype handles the plain 2D case only - no src1-over-src0 broadcast
+    if (src1->ne[2] != src0->ne[2] || src1->ne[3] != src0->ne[3]) return false;
+
+    const ggml_tensor_extra_gpu * extra = (const ggml_tensor_extra_gpu *) src0->extra;
+    const bool reordered = extra && extra->optimized_feature.reorder;
+
+    dnnl_decomp_entry e;
+    {
+        std::lock_guard<std::mutex> lock(g_decomp_mutex);
+        auto it = g_decomp_cache.find((const void *) src0_dd_i);
+        if (it == g_decomp_cache.end()) {
+            e = dnnl_decomp_repack(src0, src0_dd_i, ne10, row_diff, reordered, stream);
+            if (!e.w) return false;
+            g_decomp_cache[(const void *) src0_dd_i] = e;
+        } else {
+            e = it->second;
+        }
+    }
+
+    try {
+        auto eng  = ctx.engine_dnnl(stream);
+        auto strm = ctx.stream_dnnl(stream);
+        using dt  = dnnl::memory::data_type;
+        using tag = dnnl::memory::format_tag;
+        dnnl::memory::desc src_md({src1_ncols, ne10},  dt::f16, tag::ab);
+        dnnl::memory::desc wei_md({ne10, row_diff},    dt::s4,  tag::ab);
+        dnnl::memory::desc dst_md({src1_ncols, row_diff}, dt::f32, tag::ab);
+        dnnl::memory::desc sc_md({ne10 / QK4_0, row_diff}, dt::f16, tag::ab);
+
+        // primitive_desc + primitive construction is NOT free and the shapes repeat
+        // every forward pass - cache them, or the kernel win is spent on rebuilding.
+        struct prim_key { int64_t n, k, m; bool operator==(const prim_key & o) const { return n==o.n && k==o.k && m==o.m; } };
+        struct prim_hash { size_t operator()(const prim_key & p) const {
+            return std::hash<int64_t>()(p.n) ^ (std::hash<int64_t>()(p.k) << 1) ^ (std::hash<int64_t>()(p.m) << 2); } };
+        static std::unordered_map<prim_key, dnnl::matmul, prim_hash> prim_cache;
+        static std::mutex prim_mutex;
+        const prim_key key{ src1_ncols, ne10, row_diff };
+        dnnl::matmul prim;
+        {
+            std::lock_guard<std::mutex> lock(prim_mutex);
+            auto it = prim_cache.find(key);
+            if (it == prim_cache.end()) {
+                dnnl::primitive_attr attr;
+                attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { QK4_0, 1 }, dt::f16);
+                attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+                dnnl::matmul::primitive_desc pd(eng, src_md, wei_md, dst_md, attr);
+                prim = dnnl::matmul(pd);
+                prim_cache.emplace(key, prim);
+            } else {
+                prim = it->second;
+            }
+        }
+        dnnl::memory s_m(src_md, eng, (void *) src1_f16);
+        dnnl::memory w_m(wei_md, eng, e.w);
+        dnnl::memory d_m(dst_md, eng, (void *) dst_dd_i);
+        dnnl::memory c_m(sc_md,  eng, e.s);
+        std::unordered_map<int, dnnl::memory> args{
+            { DNNL_ARG_SRC, s_m }, { DNNL_ARG_WEIGHTS, w_m }, { DNNL_ARG_DST, d_m },
+            { DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, c_m } };
+        prim.execute(strm, args);
+        { static std::atomic<int> hits{0};
+          int h = ++hits;
+          if (h == 1 || h % 500 == 0)
+              GGML_LOG_INFO("dnnl-decomp: executed %d times (last %ldx%ldx%ld)\n",
+                            h, (long) src1_ncols, (long) ne10, (long) row_diff); }
+        return true;
+    } catch (const dnnl::error & ex) {
+        GGML_LOG_WARN("%s: oneDNN decompression unavailable (%s), falling back\n", __func__, ex.message);
+        return false;
+    }
+}
+#endif
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2738,6 +2893,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          : src1_as_f16.get();
 
 #if GGML_SYCL_DNNL
+        if (ggml_sycl_dnnl_decomp_mul_mat(ctx, src0, src1, src0_dd_i, src1_ptr, dst_dd_i,
+                                          row_diff, src1_ncols, ne10, stream)) {
+            return;
+        }
         if (g_ggml_sycl_enable_dnn) {
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
@@ -3752,10 +3911,40 @@ enum class mul_mat_algo {
     MUL_MAT_SYCL = 2,
 };
 
+// EXPERIMENT (not for upstream as-is): MMQ is dead code behind an unconditional
+// false. Gate it on GGML_SYCL_ENABLE_MMQ so it can be measured; default 0 keeps
+// current behaviour exactly.
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    static const int enabled = ggml_sycl_get_env("GGML_SYCL_ENABLE_MMQ", 0);
+    if (!enabled) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The MMQ kernels tile over N (block_num_y = ceil(ncols_y / mmq_x)), so the 32
+// is a dispatch heuristic, not a kernel limit. Tunable so prefill-sized batches
+// can be measured.
+static int64_t mmq_max_cols() {
+    static int64_t v = [] {
+        const char * s = std::getenv("GGML_SYCL_MMQ_MAX_COLS");
+        return s ? std::max<int64_t>(1, std::atoll(s)) : (int64_t) MMQ_MAX_BATCH_SIZE;
+    }();
+    return v;
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
@@ -4681,7 +4870,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // Workaround in https://github.com/ggml-org/llama.cpp/commit/95f84d5ce8b449a9b16009434aca800df504a02e
     use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
 #ifdef SYCL_USE_XMX
-    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= mmq_max_cols());
 #endif // SYCL_USE_XMX
 
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
