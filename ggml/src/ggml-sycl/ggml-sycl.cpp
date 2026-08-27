@@ -4597,13 +4597,24 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
+// Max activation columns routed through MMVQ. Above this, dequantize + GEMM wins.
+static int64_t mmvq_max_cols() {
+    static int64_t v = [] {
+        const char * s = std::getenv("GGML_SYCL_MMVQ_MAX_COLS");
+        return s ? std::max<int64_t>(1, std::atoll(s)) : (int64_t) MMVQ_MAX_BATCH_SIZE;
+    }();
+    return v;
+}
+
 static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-           // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
-           // all reorderable types have a _switch_ncols kernel.
-           dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+           // Bound by what MMVQ will accept, not by 8: ggml_sycl_op_mul_mat_vec_q chunks a
+           // wider request into groups of MMVQ_MAX_BATCH_SIZE, so each kernel still sees a
+           // width its _switch_ncols covers. Gating on 8 left concurrent batches (parallel
+           // slots, wide spec verify) on the unreordered kernel.
+           dst->src[1]->ne[1] <= mmvq_max_cols() && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
@@ -4666,15 +4677,6 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
-}
-
-// Max activation columns routed through MMVQ. Above this, dequantize + GEMM wins.
-static int64_t mmvq_max_cols() {
-    static int64_t v = [] {
-        const char * s = std::getenv("GGML_SYCL_MMVQ_MAX_COLS");
-        return s ? std::max<int64_t>(1, std::atoll(s)) : (int64_t) MMVQ_MAX_BATCH_SIZE;
-    }();
-    return v;
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
