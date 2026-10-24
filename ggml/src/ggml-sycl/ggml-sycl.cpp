@@ -7497,7 +7497,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                    (op->src[0]->type == GGML_TYPE_F32 ||
                     (op->src[0]->type == GGML_TYPE_Q1_0 && op->src[0]->ne[2] == op->src[1]->ne[2] &&
                      op->src[0]->ne[3] == op->src[1]->ne[3])) &&
-                   op->src[1]->type == GGML_TYPE_F32;
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   // ggml_sycl_op_out_prod asserts both of these (outprod.cpp); report them so the
+                   // scheduler falls back instead of aborting (hit by the DFlash drafter of Nemotron 3.5 Bolt 74B)
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
